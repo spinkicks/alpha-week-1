@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// Deny-by-default. Each collection opens only the access the MVP needs.
+// Engagement counts and recommendation scores are written exclusively by
+// Cloud Functions via the Admin SDK, which bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function isUser(uid) { return isSignedIn() && request.auth.uid == uid; }
+
+    // Profiles are readable by any signed-in user; writable only by the owner.
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isUser(uid)
+                    && request.resource.data.handle is string
+                    && request.resource.data.displayName is string
+                    && request.resource.data.followerCount == 0
+                    && request.resource.data.followingCount == 0;
+      // Owner may edit profile fields, but handle and counts are immutable here
+      // (handle is fixed at signup; counts are maintained server-side).
+      allow update: if isUser(uid)
+                    && request.resource.data.handle == resource.data.handle
+                    && request.resource.data.followerCount == resource.data.followerCount
+                    && request.resource.data.followingCount == resource.data.followingCount;
+      allow delete: if false;
+    }
+
+    // Handle uniqueness registry. Created transactionally at signup; immutable after.
+    match /handles/{handle} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /videos/{videoId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+                    && request.resource.data.authorId == request.auth.uid
+                    && request.resource.data.likeCount == 0
+                    && request.resource.data.commentCount == 0
+                    && request.resource.data.engagementScore == 0;
+      // Counts/score are owned by Cloud Functions; clients never mutate them.
+      allow update: if false;
+      allow delete: if isSignedIn() && resource.data.authorId == request.auth.uid;
+
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+        allow update: if false;
+        allow delete: if isSignedIn() && resource.data.authorId == request.auth.uid;
+      }
+    }
+
+    // Append-only engagement log consumed by the scoring/affinity functions.
+    match /engagementEvents/{eventId} {
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+
+    // Join records keyed by `${uid}_${videoId}`.
+    match /likes/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow update: if false;
+    }
+    match /favorites/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow update: if false;
+    }
+
+    // Social graph edges keyed by `${followerId}_${followeeId}`.
+    match /follows/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.followerId == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.followerId == request.auth.uid;
+      allow update: if false;
+    }
+
+    // Per-user affinity vectors are computed server-side; owner read-only.
+    match /userAffinities/{uid} {
+      allow read: if isUser(uid);
+      allow write: if false;
+    }
+
+    // Moderation reports: create-only from clients; reviewed server-side.
+    match /reports/{reportId} {
+      allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+
+    // Anything not matched above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
